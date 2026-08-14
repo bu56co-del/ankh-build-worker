@@ -7,9 +7,27 @@ CIPHER_PATH="${2:?cipher path required}"
 CRYPTO_PATH="${3:?crypto path required}"
 WORK_ROOT="${4:?work root required}"
 ARTIFACT_ROOT="${5:?artifact root required}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+canonical_file() {
+    local label="$1" path="$2" dir base
+    [ -f "$path" ] || { printf '[ERROR] missing %s\n' "$label" >&2; exit 1; }
+    dir="$(cd "$(dirname "$path")" && pwd -P)"
+    base="$(basename "$path")"
+    printf '%s/%s\n' "$dir" "$base"
+}
+
+# These inputs are supplied as repository-relative paths by the workflow. The
+# product build changes directories, so pin every helper/input path before any
+# `cd`; otherwise the final encrypted-output step can lose the capsule utility.
+REQUEST_PATH="$(canonical_file 'build request' "$REQUEST_PATH")"
+CIPHER_PATH="$(canonical_file 'encrypted source capsule' "$CIPHER_PATH")"
+CRYPTO_PATH="$(canonical_file 'capsule utility' "$CRYPTO_PATH")"
+[ -x "$CRYPTO_PATH" ] || { echo '[ERROR] capsule utility is not executable' >&2; exit 1; }
 
 mkdir -p "$WORK_ROOT" "$ARTIFACT_ROOT"
+WORK_ROOT="$(cd "$WORK_ROOT" && pwd -P)"
+ARTIFACT_ROOT="$(cd "$ARTIFACT_ROOT" && pwd -P)"
 BUILD_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["build_id"])' "$REQUEST_PATH")"
 WORKER_FINGERPRINT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["worker_fingerprint"])' "$REQUEST_PATH")"
 [[ "$BUILD_ID" =~ ^[0-9a-f]{64}$ ]] || { echo '[ERROR] invalid build request'; exit 1; }
@@ -44,7 +62,7 @@ if crypt decrypt "$CIPHER_PATH" "$SOURCE_ZIP" "ankh-source-v1:$BUILD_ID" \
         --expected-worker-fingerprint "$WORKER_FINGERPRINT" \
         >>"$PRIVATE_LOG" 2>&1; then
 
-    {
+    (
         cd "$SOURCE_ROOT/daemon"
         cargo test --locked --quiet
         cargo build --release --locked --quiet
@@ -54,7 +72,7 @@ if crypt decrypt "$CIPHER_PATH" "$SOURCE_ZIP" "ankh-source-v1:$BUILD_ID" \
         cargo test --lib --locked --quiet
         cargo build --release --locked --quiet --target x86_64-apple-darwin
         cargo build --release --locked --quiet --target aarch64-apple-darwin
-    } >>"$PRIVATE_LOG" 2>&1 && {
+    ) >>"$PRIVATE_LOG" 2>&1 && {
         mkdir -p "$WORK_ROOT/universal"
         lipo -create \
             -output "$WORK_ROOT/universal/ankh-opener-daemon" \
