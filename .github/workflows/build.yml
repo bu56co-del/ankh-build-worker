@@ -1,0 +1,159 @@
+name: Encrypted Cross-Platform Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: encrypted-cross-platform-worker
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_NET_RETRY: 10
+
+jobs:
+  policy:
+    name: Verify ciphertext-only request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Enforce public worker policy
+        run: python3 tools/verify_public_tree.py
+
+  build-windows:
+    name: Build encrypted Windows output
+    needs: policy
+    runs-on: windows-latest
+    timeout-minutes: 45
+    environment: ankh-build
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Select stable Rust
+        shell: pwsh
+        run: |
+          rustup update stable
+          rustup default stable
+          rustc --version
+          cargo --version
+      - name: Build public capsule utility
+        shell: pwsh
+        run: cargo build --release --locked --manifest-path tools/capsule-crypt/Cargo.toml --quiet
+      - name: Run encrypted Windows build
+        shell: pwsh
+        env:
+          ANKH_CAPSULE_KEY_B64: ${{ secrets.ANKH_CAPSULE_KEY_B64 }}
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'encrypted-worker'
+          $out = Join-Path $env:RUNNER_TEMP 'encrypted-artifacts'
+          ./tools/run_windows.ps1 `
+            -RequestPath REQUEST.json `
+            -CipherPath source.enc `
+            -CryptoPath tools/capsule-crypt/target/release/ankh-capsule-crypt.exe `
+            -WorkRoot $work `
+            -ArtifactRoot $out
+      - name: Upload encrypted Windows result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: encrypted-windows
+          path: ${{ runner.temp }}/encrypted-artifacts/
+          if-no-files-found: error
+          retention-days: 1
+
+
+  build-macos:
+    name: Build encrypted macOS output
+    needs: policy
+    runs-on: macos-latest
+    timeout-minutes: 55
+    environment: ankh-build
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Select stable Rust and targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup update stable
+          rustup default stable
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          rustc --version
+          cargo --version
+      - name: Build public capsule utility
+        shell: bash
+        run: cargo build --release --locked --manifest-path tools/capsule-crypt/Cargo.toml --quiet
+      - name: Run encrypted macOS build
+        shell: bash
+        env:
+          ANKH_CAPSULE_KEY_B64: ${{ secrets.ANKH_CAPSULE_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          bash tools/run_macos.sh \
+            REQUEST.json \
+            source.enc \
+            tools/capsule-crypt/target/release/ankh-capsule-crypt \
+            "$RUNNER_TEMP/encrypted-worker" \
+            "$RUNNER_TEMP/encrypted-artifacts"
+      - name: Upload encrypted macOS result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: encrypted-macos
+          path: ${{ runner.temp }}/encrypted-artifacts/
+          if-no-files-found: error
+          retention-days: 1
+
+
+  release:
+    name: Publish encrypted result
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: encrypted-*
+          path: artifacts
+          merge-multiple: true
+      - name: Verify encrypted artifacts
+        run: python3 tools/verify_release.py --request REQUEST.json --artifacts artifacts --output release
+      - name: Publish immutable encrypted release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_id=$(python3 -c 'import json; print(json.load(open("REQUEST.json"))["build_id"])')
+          tag="encrypted-${build_id}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          printf 'Authenticated encrypted build output.\n\nBuild ID: %s\nRun: %s attempt %s\n' \
+            "$build_id" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > release-notes.txt
+          gh release create "$tag" release/* \
+            --title "Encrypted build $build_id" \
+            --notes-file release-notes.txt \
+            --latest
+      - name: Report encrypted build outcome
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - artifacts/windows-status.json artifacts/macos-status.json <<'PY'
+          import json, sys
+          states = [json.load(open(path, encoding='utf-8')).get('success') is True for path in sys.argv[1:]]
+          raise SystemExit(0 if all(states) else 1)
+          PY

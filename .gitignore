@@ -1,0 +1,7 @@
+target/
+work/
+artifacts/
+release/
+*.zip
+*.tmp
+.DS_Store
