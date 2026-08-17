@@ -12,6 +12,20 @@ import shutil
 import sys
 
 PLATFORMS = ("windows", "macos")
+FAILURE_STAGES = {
+    "windows": {
+        "decrypt", "extract", "daemon_test", "daemon_build", "pet_test",
+        "pet_build", "packaging", "output_encryption",
+    },
+    "macos": {
+        "decrypt", "extract", "daemon_test", "daemon_build", "pet_test",
+        "pet_build", "universal_merge", "signing", "packaging",
+        "output_encryption",
+    },
+}
+FAILURE_CODES = {"command_failed"}
+CAPSULE_MAGIC = b"ANKHCAP1"
+MIN_CAPSULE_BYTES = len(CAPSULE_MAGIC) + 24 + 16
 
 
 def die(message: str) -> "NoReturn":
@@ -24,6 +38,17 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def require_encrypted_capsule(path: Path) -> None:
+    try:
+        if path.stat().st_size < MIN_CAPSULE_BYTES:
+            die("invalid encrypted worker artifact")
+        with path.open("rb") as f:
+            if f.read(len(CAPSULE_MAGIC)) != CAPSULE_MAGIC:
+                die("invalid encrypted worker artifact")
+    except OSError:
+        die("invalid encrypted worker artifact")
 
 
 def load_json(path: Path) -> dict[str, object]:
@@ -67,16 +92,28 @@ def main() -> int:
         status = load_json(status_path)
         fields = {
             "schema", "build_id", "platform", "success",
+            "failure_stage", "failure_code",
             "output_cipher_sha256", "output_cipher_bytes",
             "log_cipher_sha256", "log_cipher_bytes",
         }
         if set(status) != fields:
             die(f"unexpected fields in {status_path.name}")
-        if status["schema"] != 1 or status["build_id"] != build_id or status["platform"] != platform:
+        if status["schema"] != 2 or status["build_id"] != build_id or status["platform"] != platform:
             die(f"identity mismatch in {status_path.name}")
         if status["success"] not in (True, False):
             die(f"{platform} build status is not boolean")
+        if status["success"] is True:
+            if status["failure_stage"] is not None or status["failure_code"] is not None:
+                die(f"{platform} successful status contains failure metadata")
+        elif status["failure_stage"] not in FAILURE_STAGES[platform] or status["failure_code"] not in FAILURE_CODES:
+            die(f"{platform} failure classification is invalid")
         all_success = all_success and status["success"] is True
+        if status["output_cipher_sha256"] is None or status["output_cipher_bytes"] is None:
+            die(f"{platform} output ciphertext metadata is missing")
+        if status["log_cipher_sha256"] is None or status["log_cipher_bytes"] is None:
+            die(f"{platform} log ciphertext metadata is missing")
+        require_encrypted_capsule(output_cipher)
+        require_encrypted_capsule(log_cipher)
         if status["output_cipher_sha256"] != sha256_file(output_cipher):
             die(f"{platform} output ciphertext hash mismatch")
         if status["log_cipher_sha256"] != sha256_file(log_cipher):

@@ -13,12 +13,23 @@ function Get-Sha256([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Get-OptionalSha256([string]$Path) {
+    if (Test-Path -LiteralPath $Path -PathType Leaf) { return (Get-Sha256 $Path) }
+    return $null
+}
+
+function Get-OptionalSize([string]$Path) {
+    if (Test-Path -LiteralPath $Path -PathType Leaf) { return (Get-Item -LiteralPath $Path).Length }
+    return $null
+}
+
 function Invoke-CapsuleCrypt(
     [string]$Mode,
     [string]$InputPath,
     [string]$OutputPath,
     [string]$Aad,
-    [string]$Key
+    [string]$Key,
+    [string]$LogPath
 ) {
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $CryptoPath
@@ -35,6 +46,9 @@ function Invoke-CapsuleCrypt(
     $stdout = $process.StandardOutput.ReadToEnd()
     $stderr = $process.StandardError.ReadToEnd()
     $process.WaitForExit()
+    if (-not [string]::IsNullOrEmpty($LogPath)) {
+        [System.IO.File]::AppendAllText($LogPath, $stdout + $stderr, [System.Text.UTF8Encoding]::new($false))
+    }
     if ($process.ExitCode -ne 0) {
         throw "capsule crypt failed"
     }
@@ -55,18 +69,22 @@ function Write-Status(
     [string]$Path,
     [string]$BuildId,
     [bool]$Success,
+    [string]$FailureStage,
+    [string]$FailureCode,
     [string]$OutputCipher,
     [string]$LogCipher
 ) {
     $status = [ordered]@{
-        schema = 1
+        schema = 2
         build_id = $BuildId
         platform = 'windows'
         success = $Success
-        output_cipher_sha256 = Get-Sha256 $OutputCipher
-        output_cipher_bytes = (Get-Item -LiteralPath $OutputCipher).Length
-        log_cipher_sha256 = Get-Sha256 $LogCipher
-        log_cipher_bytes = (Get-Item -LiteralPath $LogCipher).Length
+        failure_stage = $(if ($Success) { $null } else { $FailureStage })
+        failure_code = $(if ($Success) { $null } else { $FailureCode })
+        output_cipher_sha256 = (Get-OptionalSha256 $OutputCipher)
+        output_cipher_bytes = (Get-OptionalSize $OutputCipher)
+        log_cipher_sha256 = (Get-OptionalSha256 $LogCipher)
+        log_cipher_bytes = (Get-OptionalSize $LogCipher)
     }
     [System.IO.File]::WriteAllText(
         $Path,
@@ -100,25 +118,30 @@ $outputCipher = Join-Path $ArtifactRoot 'windows-output.enc'
 $logCipher = Join-Path $ArtifactRoot 'windows-log.enc'
 $statusPath = Join-Path $ArtifactRoot 'windows-status.json'
 $success = $false
+$failureStage = 'decrypt'
+$failureCode = 'command_failed'
+[System.IO.File]::WriteAllText($privateLog, "private Windows build log`n", [System.Text.UTF8Encoding]::new($false))
 
 try {
-    Invoke-CapsuleCrypt 'decrypt' $CipherPath $sourceZip ("ankh-source-v1:" + $buildId) $key
-    & python (Join-Path $PSScriptRoot 'extract_source.py') --archive $sourceZip --output $sourceRoot --expected-build-id $buildId --expected-worker-fingerprint $workerFingerprint *> $null
+    Invoke-CapsuleCrypt 'decrypt' $CipherPath $sourceZip ("ankh-source-v1:" + $buildId) $key $privateLog
+    $failureStage = 'extract'
+    & python (Join-Path $PSScriptRoot 'extract_source.py') --archive $sourceZip --output $sourceRoot --expected-build-id $buildId --expected-worker-fingerprint $workerFingerprint *>> $privateLog
     if ($LASTEXITCODE -ne 0) { throw 'source capsule verification failed' }
 
-    [System.IO.File]::WriteAllText($privateLog, "private Windows build log`n", [System.Text.UTF8Encoding]::new($false))
     $steps = @(
-        @{ dir = (Join-Path $sourceRoot 'daemon'); args = @('test', '--locked', '--quiet') },
-        @{ dir = (Join-Path $sourceRoot 'daemon'); args = @('build', '--release', '--locked', '--quiet') },
-        @{ dir = (Join-Path $sourceRoot 'pet'); args = @('test', '--lib', '--locked', '--quiet') },
-        @{ dir = (Join-Path $sourceRoot 'pet'); args = @('build', '--release', '--locked', '--quiet') }
+        @{ stage = 'daemon_test'; dir = (Join-Path $sourceRoot 'daemon'); args = @('test', '--locked', '--quiet') },
+        @{ stage = 'daemon_build'; dir = (Join-Path $sourceRoot 'daemon'); args = @('build', '--release', '--locked', '--quiet') },
+        @{ stage = 'pet_test'; dir = (Join-Path $sourceRoot 'pet'); args = @('test', '--lib', '--locked', '--quiet') },
+        @{ stage = 'pet_build'; dir = (Join-Path $sourceRoot 'pet'); args = @('build', '--release', '--locked', '--quiet') }
     )
     foreach ($step in $steps) {
+        $failureStage = $step.stage
         if (-not (Invoke-PrivateCargo $step.dir $step.args $privateLog)) {
             throw 'private build or test failed'
         }
     }
 
+    $failureStage = 'packaging'
     & python (Join-Path $PSScriptRoot 'package_output.py') `
         --platform windows `
         --source-manifest $sourceManifest `
@@ -141,9 +164,28 @@ finally {
     if (-not (Test-Path -LiteralPath $privateLog)) {
         [System.IO.File]::WriteAllText($privateLog, "build did not start`n", [System.Text.UTF8Encoding]::new($false))
     }
-    Invoke-CapsuleCrypt 'encrypt' $bundle $outputCipher ("ankh-output-v1:" + $buildId + ':windows') $key
-    Invoke-CapsuleCrypt 'encrypt' $privateLog $logCipher ("ankh-log-v1:" + $buildId + ':windows') $key
-    Write-Status $statusPath $buildId $success $outputCipher $logCipher
+    $buildFailureStage = $failureStage
+    $outputEncrypted = $false
+    $logEncrypted = $false
+    try {
+        Invoke-CapsuleCrypt 'encrypt' $bundle $outputCipher ("ankh-output-v1:" + $buildId + ':windows') $key $privateLog
+        $outputEncrypted = $true
+    } catch {
+        Remove-Item -LiteralPath $outputCipher -Force -ErrorAction SilentlyContinue
+    }
+    try {
+        Invoke-CapsuleCrypt 'encrypt' $privateLog $logCipher ("ankh-log-v1:" + $buildId + ':windows') $key $null
+        $logEncrypted = $true
+    } catch {
+        Remove-Item -LiteralPath $logCipher -Force -ErrorAction SilentlyContinue
+    }
+    if ($outputEncrypted -and $logEncrypted) {
+        if (-not $success) { $failureStage = $buildFailureStage }
+    } else {
+        $success = $false
+        $failureStage = 'output_encryption'
+    }
+    Write-Status $statusPath $buildId $success $failureStage $failureCode $outputCipher $logCipher
     $key = $null
     [GC]::Collect()
 }
