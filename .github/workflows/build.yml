@@ -1,0 +1,82 @@
+name: Static Cross-Platform Build Factory
+on:
+  push:
+    branches: ['request/**']
+permissions:
+  contents: read
+concurrency:
+  group: static-cross-platform-factory
+  cancel-in-progress: false
+env:
+  CARGO_TERM_COLOR: never
+  RUSTUP_TOOLCHAIN: 1.85.0
+jobs:
+  policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {persist-credentials: false, fetch-depth: 2}
+      - run: python3 tools/verify_public_tree.py
+  windows:
+    needs: policy
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {persist-credentials: false}
+      - shell: pwsh
+        run: |
+          cargo test --manifest-path daemon/Cargo.toml --locked --quiet
+          cargo test --manifest-path pet/Cargo.toml --lib --locked --quiet
+          cargo build --release --locked --manifest-path daemon/Cargo.toml
+          cargo build --release --locked --manifest-path pet/Cargo.toml
+          New-Item -ItemType Directory out
+          Copy-Item daemon/target/release/ankh-opener-daemon.exe out/
+          Copy-Item pet/target/release/ankh-pet.exe out/
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with: {name: windows, path: out/, if-no-files-found: error, retention-days: 1}
+  macos:
+    needs: policy
+    runs-on: macos-14
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {persist-credentials: false}
+      - run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+      - run: |
+          set -euo pipefail
+          cargo test --manifest-path daemon/Cargo.toml --locked --quiet
+          cargo test --manifest-path pet/Cargo.toml --lib --locked --quiet
+          for target in x86_64-apple-darwin aarch64-apple-darwin; do
+            cargo build --release --locked --target "$target" --manifest-path daemon/Cargo.toml
+            cargo build --release --locked --target "$target" --manifest-path pet/Cargo.toml
+          done
+          mkdir out
+          lipo -create daemon/target/{x86_64-apple-darwin,aarch64-apple-darwin}/release/ankh-opener-daemon -output out/ankh-opener-daemon
+          lipo -create pet/target/{x86_64-apple-darwin,aarch64-apple-darwin}/release/ankh-pet -output out/ankh-pet
+          chmod 755 out/*
+          codesign --force --sign - out/ankh-opener-daemon
+          codesign --force --sign - out/ankh-pet
+          codesign --verify --strict out/ankh-opener-daemon out/ankh-pet
+          lipo -verify_arch x86_64 arm64 out/ankh-opener-daemon
+          lipo -verify_arch x86_64 arm64 out/ankh-pet
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with: {name: macos, path: out/, if-no-files-found: error, retention-days: 1}
+  bundle:
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: {contents: write}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {persist-credentials: false, fetch-depth: 2}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with: {pattern: '*', path: artifacts}
+      - run: python3 tools/package_bundle.py --request BUILD_REQUEST.json --windows artifacts/windows --macos artifacts/macos --public-commit "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --output ankh-build-bundle.zip
+      - env: {GH_TOKEN: '${{ github.token }}'}
+        run: |
+          set -euo pipefail
+          id=$(python3 -c 'import json; print(json.load(open("BUILD_REQUEST.json"))["build_id"])')
+          factory=$(git rev-parse HEAD^)
+          gh release create "build-${id}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ankh-build-bundle.zip --target "$factory" --title "Build $id" --notes "Static factory output; exact request $GITHUB_SHA; run $GITHUB_RUN_ID attempt $GITHUB_RUN_ATTEMPT." --latest=false
