@@ -37,7 +37,7 @@ if static_changed.strip(): die('routine request modified static worker tooling')
 actual=[]
 for rel in sorted(set(seen)-STATIC-{'BUILD_REQUEST.json'}):
  data=(ROOT/rel).read_bytes(); actual.append({'path':rel,'sha256':hashlib.sha256(data).hexdigest(),'size':len(data)})
-if request['toolchain']!='rustc 1.85.0 (4d91de4e4 2025-02-17); windows-2022; macos-14': die('toolchain identity mismatch')
+if request['toolchain']!='rustc 1.88.0 (6b00bc388 2025-06-23); windows-2022; macos-14': die('toolchain identity mismatch')
 identity={k:request[k] for k in ('schema','private_source_commit','semantic_version','worker_commit','workflow_sha256','toolchain')}; identity['files']=actual
 canonical=(json.dumps(identity,sort_keys=True,separators=(',',':'))+'\n').encode()
 if request['files']!=actual or request['build_id']!=hashlib.sha256(canonical).hexdigest(): die('request does not bind exact public source')
