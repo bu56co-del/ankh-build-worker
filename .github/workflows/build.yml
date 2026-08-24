@@ -61,8 +61,8 @@ jobs:
           codesign --force --sign - out/ankh-opener-daemon
           codesign --force --sign - out/ankh-pet
           codesign --verify --strict out/ankh-opener-daemon out/ankh-pet
-          lipo -verify_arch x86_64 arm64 out/ankh-opener-daemon
-          lipo -verify_arch x86_64 arm64 out/ankh-pet
+          lipo out/ankh-opener-daemon -verify_arch x86_64 arm64
+          lipo out/ankh-pet -verify_arch x86_64 arm64
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with: {name: macos, path: out/, if-no-files-found: error, retention-days: 1}
   bundle:
