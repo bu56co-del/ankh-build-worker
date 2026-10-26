@@ -37,7 +37,12 @@ jobs:
           Copy-Item daemon/target/release/ankh-opener-daemon.exe out/
           Copy-Item pet/target/release/ankh-pet.exe out/
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with: {name: windows, path: out/, if-no-files-found: error, retention-days: 1}
+        with:
+          name: windows
+          path: out/
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
   macos:
     needs: policy
     runs-on: macos-14
@@ -64,7 +69,12 @@ jobs:
           lipo out/ankh-opener-daemon -verify_arch x86_64 arm64
           lipo out/ankh-pet -verify_arch x86_64 arm64
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with: {name: macos, path: out/, if-no-files-found: error, retention-days: 1}
+        with:
+          name: macos
+          path: out/
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
   bundle:
     needs: [windows, macos]
     runs-on: ubuntu-latest
@@ -74,8 +84,27 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with: {persist-credentials: false, fetch-depth: 2}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with: {pattern: '*', path: artifacts}
+        with:
+          name: windows
+          path: artifacts/windows
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: macos
+          path: artifacts/macos
       - run: python3 tools/package_bundle.py --request BUILD_REQUEST.json --windows artifacts/windows --macos artifacts/macos --public-commit "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --output ankh-build-bundle.zip
+      - id: bundle_identity
+        run: |
+          set -euo pipefail
+          digest="$(sha256sum ankh-build-bundle.zip | awk '{print $1}')"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          printf 'sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ankh-build-bundle-sha256-${{ steps.bundle_identity.outputs.sha256 }}-attempt-${{ github.run_attempt }}
+          path: ankh-build-bundle.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
       - env: {GH_TOKEN: '${{ github.token }}'}
         run: |
           set -euo pipefail
